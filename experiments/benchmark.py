@@ -151,11 +151,27 @@ def create_benchmark_datasets_if_not_exist(dataset_description_path='dataset_des
             },
         },
         {
+            "dataset_name": "sine_trans_200_20_dynamic",
+            "dataset_builder": "DynamicSineTransDataset",
+            "dataset_dictionary": {
+                "n_samples": 2000,
+                "n_timesteps": 60
+            },
+        },
+        {
             "dataset_name": "beta_900_20",
             "dataset_builder": "BetaDataset",
             "dataset_dictionary": {
                 "n_samples": 900,
                 "n_timesteps": 20
+            },
+        },
+        {
+            "dataset_name": "beta_2000_60_dynamic",
+            "dataset_builder": "DynamicBetaDataset",
+            "dataset_dictionary": {
+                "n_samples": 2000,
+                "n_timesteps": 60
             },
         },
     ]
@@ -389,7 +405,9 @@ if __name__ == "__main__":
         'stress-strain-lot-max-0.2': 1.0,
         'tacrolimus_visit_12': 12.5,
         'sine_trans_200_20': 1.0, # it was 3.0 for some reason but I think it was a typo
-        'beta_900_20': 1.0
+        'sine_trans_200_20_dynamic': 1.0,
+        'beta_900_20': 1.0,
+        'beta_2000_60_dynamic': 1.0
     }
 
     tts_n_features = {
@@ -402,11 +420,15 @@ if __name__ == "__main__":
         'stress-strain-lot-max-0.2': 10,
         'tacrolimus_visit_12': 9,
         'sine_trans_200_20': 1,
-        'beta_900_20': 2
+        'sine_trans_200_20_dynamic': 1,
+        'beta_900_20': 2,
+        'beta_2000_60_dynamic': 2
     }
 
     tts_n_features_dynamic = {
         'synthetic_tumor_wilkerson_dynamic_1': 3,
+        'sine_trans_200_20_dynamic': 1,
+        'beta_2000_60_dynamic': 1
     }
 
     rnn_max_len = {
@@ -419,7 +441,9 @@ if __name__ == "__main__":
         'stress-strain-lot-max-0.2': 774,
         'tacrolimus_visit_12': 11,
         'sine_trans_200_20': 20,
+        'sine_trans_200_20_dynamic': 20,
         'beta_900_20': 20,
+        'beta_2000_60_dynamic': 20
     }
 
     if args.validate:

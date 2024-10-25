@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import numpy as np
 import pytorch_lightning as pl
 
@@ -62,20 +63,22 @@ class DynamicEncoder(torch.nn.Module):
         """
         super().__init__()
         self.config = config
-        self.n_dynamic_features = config.n_features_dynamic * 1 # Number of dynamic features
-        self.hidden_size = config.dynamic_encoder.hidden_size  # Hidden size of the RNN
-        self.rnn_layers = config.dynamic_encoder.rnn_layers  # Number of RNN layers
-        self.dropout_p = config.dynamic_encoder.dropout_p  # Dropout probability
-        self.rnn_type = config.dynamic_encoder.rnn_type  # RNN type ('lstm', 'gru', etc.)
+        self.n_dynamic_features = config.n_features_dynamic * 1 
+        self.hidden_size = config.dynamic_encoder.hidden_size  
+        self.rnn_layers = config.dynamic_encoder.rnn_layers  
+        self.dropout_p = config.dynamic_encoder.dropout_p  
+        self.rnn_type = config.dynamic_encoder.rnn_type  
+
+        # self.position_embedding = nn.Embedding(60, self.n_dynamic_features)
 
         # Choose RNN type (LSTM or GRU)
         if self.rnn_type == 'lstm':
             self.rnn = torch.nn.LSTM(
-                input_size=self.n_dynamic_features,  # Input is dynamic feature size
-                hidden_size=self.hidden_size,  # Hidden size of RNN
-                num_layers=self.rnn_layers,  # Number of recurrent layers
-                batch_first=True,  # Input has shape (batch_size, time_steps, n_dynamic_features)
-                dropout=self.dropout_p if self.rnn_layers > 1 else 0.0  # Apply dropout only if there are multiple layers
+                input_size=self.n_dynamic_features,  
+                hidden_size=self.hidden_size,  
+                num_layers=self.rnn_layers,  
+                batch_first=True,  
+                dropout=self.dropout_p if self.rnn_layers > 1 else 0.0 
             )
         elif self.rnn_type == 'gru':
             self.rnn = torch.nn.GRU(
@@ -88,16 +91,15 @@ class DynamicEncoder(torch.nn.Module):
         else:
             raise ValueError(f"Unsupported RNN type: {self.rnn_type}")
 
-        # Final fully connected layer to project RNN output to latent space
-        latent_size = self.config.n_basis  # Output size for the latent space (based on n_basis)
+
+        latent_size = self.config.n_basis  
 
         if is_dynamic_bias_enabled(config):
-            latent_size += 1  # Add bias if enabled
+            latent_size += 1 
 
-        # Linear layer to project the final hidden state to the latent space
+
         self.fc = torch.nn.Linear(self.hidden_size, latent_size)
 
-        # Optional: Add batch normalization and activation
         self.batch_norm = torch.nn.BatchNorm1d(latent_size)
         self.activation = torch.nn.ReLU()
         self.dropout = torch.nn.Dropout(self.dropout_p)
@@ -111,19 +113,19 @@ class DynamicEncoder(torch.nn.Module):
         """
         # Pass the input through the RNN (LSTM or GRU)
         x = x.permute(0,2,1)
+        # batch_size, time_steps, _ = x.size()
+        # positions = torch.arange(0, time_steps, device=x.device).unsqueeze(0).repeat(batch_size, 1)
+        # position_embeds = self.position_embedding(positions)
+        # x = torch.cat((x, position_embeds), dim=2) 
         # print(x.shape)
         # batch_size, n_dynamic_features, n_intervals, n_derivatives = x.shape
         # x = x.view(batch_size, n_intervals, n_dynamic_features * n_derivatives) 
         rnn_output, (h_n, c_n) = self.rnn(x) if self.rnn_type == 'lstm' else self.rnn(x)
 
-        # We use the last hidden state (h_n) from the RNN layers as the representation
-        # h_n has shape (num_layers, batch_size, hidden_size), so we take the last layer's hidden state
-        last_hidden_state = h_n[-1]  # Shape: (batch_size, hidden_size)
+        last_hidden_state = h_n[-1] 
 
-        # Pass the last hidden state through the final fully connected layer
-        latent = self.fc(last_hidden_state)  # Shape: (batch_size, latent_size)
+        latent = self.fc(last_hidden_state)
 
-        # Apply batch normalization, activation, and dropout
         latent = self.batch_norm(latent)
         latent = self.activation(latent)
         latent = self.dropout(latent)
@@ -261,7 +263,7 @@ class TTSDynamic(torch.nn.Module):
             h_combined = h_combined[:,:-1]
 
         if contrastive:
-            contrastive_loss = self.compute_contrastive_loss(h, h_dynamic)
+            contrastive_loss = self.compute_contrastive_loss(h, h_dynamic) + self.compute_kl_divergence_loss(h, h_dynamic)
         
         if self.config.dataloader_type == "iterative":
             if is_dynamic_bias_enabled(self.config):
@@ -280,30 +282,30 @@ class TTSDynamic(torch.nn.Module):
             return output
             
     def compute_contrastive_loss(self, h_static, h_dynamic, temperature=0.07):
-        """
-        Compute the contrastive loss between static and dynamic latent representations.
-        Args:
-            h_static: Latent representation of static features (batch_size, latent_size)
-            h_dynamic: Latent representation of dynamic features (batch_size, latent_size)
-            temperature: Scaling factor for contrastive learning (default: 0.07)
-        Returns:
-            Contrastive loss between static and dynamic representations
-        """
-        # Normalize the latent vectors to unit length
+
         h_static_norm = torch.nn.functional.normalize(h_static, dim=-1)
         h_dynamic_norm = torch.nn.functional.normalize(h_dynamic, dim=-1)
 
-        # Compute similarity between static and dynamic representations
         similarity_matrix = torch.matmul(h_static_norm, h_dynamic_norm.T) / temperature
 
-        # Create labels (positive pairs should have the same index)
         batch_size = h_static.size(0)
         labels = torch.arange(batch_size).to(similarity_matrix.device)
 
-        # Compute the contrastive loss (cross-entropy)
         contrastive_loss = torch.nn.functional.cross_entropy(similarity_matrix, labels)
 
         return contrastive_loss
+    
+    def compute_kl_divergence_loss(self, h_static, h_dynamic):
+
+        h_static_norm = torch.nn.functional.normalize(h_static, dim=-1)
+        h_dynamic_norm = torch.nn.functional.normalize(h_dynamic, dim=-1)
+
+        p_static = torch.nn.functional.softmax(h_static_norm, dim=-1)
+        p_dynamic = torch.nn.functional.softmax(h_dynamic_norm, dim=-1)
+
+        kl_div = torch.nn.functional.kl_div(p_static.log(), p_dynamic, reduction='batchmean')
+
+        return kl_div
         
     def predict_latent_variables(self, X, X_dynamic=None, return_aligned=False):
         """

@@ -1129,17 +1129,126 @@ class SyntheticTumorDataset(BaseDataset):
                 os_properties_flat = np.array(os_properties).flatten()
                 gl_properties_flat = np.array(gl_properties).flatten()
 
-                bp_encoded.append(np.concatenate([bp_vector_flat, bp_properties_flat]))
-                os_encoded.append(np.concatenate([os_vector_flat, os_properties_flat]))
-                gl_encoded.append(np.concatenate([gl_vector_flat, gl_properties_flat]))
+                bp_encoded.append(np.array([val for pair in zip(bp_vector_flat, bp_properties_flat) for val in pair]))
+                os_encoded.append(np.array([val for pair in zip(os_vector_flat, os_properties_flat) for val in pair]))
+                gl_encoded.append(np.array([val for pair in zip(gl_vector_flat, gl_properties_flat) for val in pair]))
 
                 # bp_encoded.append(bp_vector_flat)
                 # os_encoded.append(os_vector_flat)
                 # gl_encoded.append(gl_vector_flat)
 
-            X_dynamic = np.stack((bp_encoded, os_encoded, gl_encoded), axis=2)
+            X_dynamic_encoded = np.stack((bp_encoded, os_encoded, gl_encoded), axis=2)
 
         if equation == "wilkerson_dynamic":
-            return X, X_dynamic, ts, ys
+            return X, X_dynamic_encoded, ts, ys
         return X, ts, ys
     
+class DynamicSineTransDataset(BaseDataset):
+
+    def __init__(self, n_samples=2000, n_timesteps=60):
+        super().__init__(n_samples=n_samples, n_timesteps=n_timesteps)
+        np.random.seed(0)
+        self.X = pd.DataFrame({'x':np.random.uniform(1.0,3.0, n_samples)})
+        self.X_dynamic = pd.DataFrame({
+            'x_dynamic': [np.random.normal(0.0, 1.0, (n_timesteps,)) for _ in range(n_samples)]
+        })
+
+        self.ts = [np.linspace(0,1,n_timesteps) for i in range(n_samples)]
+        self.ys = [np.sin(2*t*np.pi/(x + np.mean(x_dynamic))) for t, x, x_dynamic in zip(self.ts, self.X['x'], self.X_dynamic['x_dynamic'])]
+        x_dynamic_knots = get_regular_knots(n_timesteps, 8)
+        splines, first_derivs, second_derivs = fit_cubic_splines_for_all_samples(
+            self.ts, np.vstack(self.X_dynamic['x_dynamic']), x_dynamic_knots
+        )
+        self.X_dynamic_encoded = []
+        
+        for i in range(n_samples):
+            dynamic_vector = encode_dynamic_feature_as_single_vector(first_derivs[i], second_derivs[i])
+            dynamic_vector_flat = dynamic_vector.flatten()
+
+            n_intervals = len(x_dynamic_knots) - 1
+            dynamic_properties = calculate_transition_properties(splines[i], x_dynamic_knots, n_intervals)
+
+            dynamic_properties_flat = np.array(dynamic_properties).flatten()
+            # dynamic_encoded = np.concatenate([dynamic_vector_flat, dynamic_properties_flat])
+            dynamic_encoded = np.array([val for pair in zip(dynamic_vector_flat, dynamic_properties_flat) for val in pair])
+            
+            self.X_dynamic_encoded.append(dynamic_encoded)
+        
+        self.X_dynamic_encoded = pd.DataFrame({'x_dynamic': self.X_dynamic_encoded})
+    
+    def get_X_ts_ys(self):
+        return self.X, self.X_dynamic_encoded, self.ts, self.ys
+    
+    def __len__(self):
+        return len(self.X)
+    
+    def get_feature_names(self):
+        return ['x']
+    
+    def get_feature_ranges(self):
+        return {
+            'x': (1, 2.5),
+            'x_dynamic' : (0, 1)
+        }
+    
+class DynamicBetaDataset(BaseDataset):
+
+    def __init__(self, n_samples=2000, n_timesteps=60):
+        super().__init__(n_samples=n_samples, n_timesteps=n_timesteps)
+        np.random.seed(0)
+
+        n_samples_per_dim = int(np.sqrt(n_samples))
+        n_samples = n_samples_per_dim**2
+        alphas = np.linspace(1.0,4.0,n_samples_per_dim)
+        betas = np.linspace(1.0,4.0,n_samples_per_dim)
+
+        grid = np.meshgrid(alphas, betas)
+    
+        cart_prod = np.stack(grid, axis=-1).reshape(-1, 2)
+
+        self.X = pd.DataFrame({'alpha':cart_prod[:,0], 'beta':cart_prod[:,1]})
+        self.X_dynamic = pd.DataFrame({
+            'x_dynamic': [np.random.normal(0.0, 1.0, (n_timesteps,)) for _ in range(len(self.X))]
+        })
+        self.ts = [np.linspace(0,1,n_timesteps) for i in range(len(self.X))]
+        self.ys = [
+            np.array([np.mean(x_dynamic) + beta.pdf(t, alpha, betap) for t in np.linspace(0, 1, n_timesteps)])
+            for alpha, betap, x_dynamic in zip(self.X['alpha'], self.X['beta'], self.X_dynamic['x_dynamic'])
+        ]
+
+        x_dynamic_knots = get_regular_knots(n_timesteps, 8)
+        splines, first_derivs, second_derivs = fit_cubic_splines_for_all_samples(
+            self.ts, np.vstack(self.X_dynamic['x_dynamic']), x_dynamic_knots
+        )
+        self.X_dynamic_encoded = []
+        
+        for i in range(n_samples):
+            dynamic_vector = encode_dynamic_feature_as_single_vector(first_derivs[i], second_derivs[i])
+            dynamic_vector_flat = dynamic_vector.flatten()
+
+            n_intervals = len(x_dynamic_knots) - 1
+            dynamic_properties = calculate_transition_properties(splines[i], x_dynamic_knots, n_intervals)
+            
+            dynamic_properties_flat = np.array(dynamic_properties).flatten()
+            # dynamic_encoded = np.concatenate([dynamic_vector_flat])
+            dynamic_encoded = np.array([val for pair in zip(dynamic_vector_flat, dynamic_properties_flat) for val in pair])
+            
+            self.X_dynamic_encoded.append(dynamic_encoded)
+        
+        self.X_dynamic_encoded = pd.DataFrame({'x_dynamic': self.X_dynamic_encoded})
+    
+    def get_X_ts_ys(self):
+        return self.X, self.X_dynamic_encoded, self.ts, self.ys
+    
+    def __len__(self):
+        return len(self.X)
+    
+    def get_feature_names(self):
+        return ['alpha', 'beta']
+    
+    def get_feature_ranges(self):
+        return {
+            'alpha': (1.0, 4.0),
+            'beta': (1.0, 4.0),
+            'x_dynamic' : (0, 1)
+        }

@@ -1294,6 +1294,99 @@ class ElasticNetBenchmark(BaseBenchmark):
 
         return {'train_loss': train_loss, 'val_loss': val_loss, 'test_loss': test_loss}
     
+class DynamicElasticNetBenchmark(BaseBenchmark):
+    """Decision Tree benchmark."""
+    
+    def get_name(self):
+        return 'Linear'
+    
+    def get_model_for_tuning(self, trial, seed):
+        """Get model for tuning."""
+        parameters = {
+            'alpha': trial.suggest_float('alpha', 0.0, 1.0),
+            'l1_ratio': trial.suggest_float('l1_ratio', 0.0, 1.0),
+        }
+        return ElasticNet(**parameters, random_state=seed)
+
+    def get_final_model(self, parameters, seed):
+        """Get model for testing."""
+        if parameters is None:
+            return ElasticNet(random_state=seed)
+        else:
+            return ElasticNet(**parameters, random_state=seed)
+    
+    def prepare_data(self, dataset: BaseDataset, train_indices, val_indices, test_indices):
+        
+        data_train = dataset.get_single_matrix(train_indices)
+        self.X_train = data_train.iloc[:,:-1]    
+        self.y_train = data_train.iloc[:,-1].to_numpy()
+        
+        data_val = dataset.get_single_matrix(val_indices)
+        self.X_val = data_val.iloc[:,:-1]
+        self.y_val = data_val.iloc[:,-1].to_numpy()
+
+        column_transformer = dataset.get_default_column_transformer()
+        y_normalizer = YNormalizer()
+
+        self.X_train = column_transformer.fit_transform(self.X_train)
+        self.y_train = y_normalizer.fit_transform(self.y_train)
+
+        self.X_val = column_transformer.transform(self.X_val)
+        self.y_val = y_normalizer.transform(self.y_val)
+
+        self.test_samples = []
+        for i in test_indices:
+            X = dataset.get_single_matrix([i]).iloc[:,:-1]
+            X = column_transformer.transform(X)
+            y = dataset.get_single_matrix([i]).iloc[:,-1].to_numpy()
+            y = y_normalizer.transform(y)
+            self.test_samples.append((X,y))
+
+        # Save the transformer using joblib
+        os.makedirs(os.path.join(self.benchmarks_dir, self.name), exist_ok=True)
+        joblib.dump(column_transformer, os.path.join(self.benchmarks_dir, self.name, 'column_transformer.joblib'))
+
+        # Save y_normalizer
+        y_normalizer.save(os.path.join(self.benchmarks_dir, self.name))
+    
+    def train(self, model, tuning=False):
+        """Train model."""
+        
+        if not tuning:
+            X_train = np.concatenate([self.X_train, self.X_val], axis=0)
+            y_train = np.concatenate([self.y_train, self.y_val], axis=0)
+        else:
+            X_train = self.X_train
+            y_train = self.y_train
+
+
+        model.fit(X_train, y_train)
+
+        # Save the model to a pickle file
+        if tuning:
+            log_dir = os.path.join(self.benchmarks_dir, self.name, 'tuning', 'logs', f'seed_{model.random_state}')
+        else:
+            log_dir =  os.path.join(self.benchmarks_dir, self.name, 'final', 'logs', f'seed_{model.random_state}')
+        os.makedirs(log_dir, exist_ok=True)
+        if not tuning:
+            with open(os.path.join(log_dir, 'model.pkl'), 'wb') as f:
+                pickle.dump(model, f)
+
+
+        train_loss = mean_squared_error(y_train, model.predict(X_train))
+        val_loss = mean_squared_error(self.y_val, model.predict(self.X_val))
+        
+        test_loss = 0
+        if not tuning:
+            for sample in self.test_samples:
+                X, y = sample
+                y_pred = model.predict(X)
+                err = mean_squared_error(y, y_pred)
+                test_loss += err
+            test_loss /= len(self.test_samples)
+
+        return {'train_loss': train_loss, 'val_loss': val_loss, 'test_loss': test_loss}
+    
 
 
 class SimpleLinearBenchmark(BaseBenchmark):
