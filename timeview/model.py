@@ -431,7 +431,7 @@ class TTSDynamic(torch.nn.Module):
             return (torch.matmul(h_combined, Phi.T) + self.bias).cpu().numpy()  # Shape: (D, N)
 
 
-# Below are neSemanticw classes required for the semantic transformer model
+# Below are new classes required for the semantic transformer model
 class SemanticTokenEncoder(nn.Module):
     """
     Build dynamical semantic tokens from:
@@ -440,7 +440,7 @@ class SemanticTokenEncoder(nn.Module):
 
     Inputs:
       motif_class: (B, K) long
-      motif_vals:  (B, K, 4) float  with columns [t0, t1, y0, y1]
+      semantic_vals:  (B, K, 4) float  with columns [t0, t1, y0, y1]
     Output:
       semantic_tokens: (B, K, d_model)
     """
@@ -498,7 +498,7 @@ class SemanticTransformer(nn.Module):
     """
     Token layout:
       token 0: static token (from static covariates)
-      tokens 1..K: motif tokens = (class, t0, t1, y0, y1) per segment
+      tokens 1..K: semantic tokens = (class, t0, t1, y0, y1) per segment
 
     Readout:
       updated static token -> latent spline coefficients (and optional bias)
