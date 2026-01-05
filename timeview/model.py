@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import pytorch_lightning as pl
-
+from typing import Optional
 from timeview.basis import BSplineBasis
 from .config import Config
 
@@ -429,3 +429,232 @@ class TTSDynamic(torch.nn.Module):
             
             # Forecast trajectories for all samples using the combined latent vectors
             return (torch.matmul(h_combined, Phi.T) + self.bias).cpu().numpy()  # Shape: (D, N)
+
+
+# Below are neSemanticw classes required for the semantic transformer model
+class SemanticTokenEncoder(nn.Module):
+    """
+    Build dynamical semantic tokens from:
+      - motif class id (integer)
+      - start_t, end_t, start_y, end_y (continuous)
+
+    Inputs:
+      motif_class: (B, K) long
+      motif_vals:  (B, K, 4) float  with columns [t0, t1, y0, y1]
+    Output:
+      semantic_tokens: (B, K, d_model)
+    """
+    def __init__(
+        self,
+        n_motif_classes: int,
+        d_model: int,
+        class_emb_dim: int = 64,
+        cont_hidden: int = 128,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.class_emb = nn.Embedding(n_motif_classes, class_emb_dim)
+
+        self.cont_mlp = nn.Sequential(
+            nn.Linear(4, cont_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(cont_hidden, class_emb_dim),
+        )
+
+        self.fuse = nn.Sequential(
+            nn.Linear(2 * class_emb_dim, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(d_model),
+        )
+
+    def forward(self, motif_class: torch.Tensor, motif_vals: torch.Tensor) -> torch.Tensor:
+        # motif_class: (B, K) long
+        # motif_vals:  (B, K, 4) float
+        c = self.class_emb(motif_class)      # (B, K, class_emb_dim)
+        v = self.cont_mlp(motif_vals)        # (B, K, class_emb_dim)
+        x = torch.cat([c, v], dim=-1)        # (B, K, 2*class_emb_dim)
+        return self.fuse(x)                  # (B, K, d_model)
+
+
+class StaticTokenEncoder(nn.Module):
+    """Static covariates -> single token encoding static context."""
+    def __init__(self, n_static: int, d_model: int, hidden: int = 128, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_static, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def forward(self, x_static: torch.Tensor) -> torch.Tensor:
+        return self.net(x_static)  # (B, d_model)
+
+
+class SemanticTransformer(nn.Module):
+    """
+    Token layout:
+      token 0: static token (from static covariates)
+      tokens 1..K: motif tokens = (class, t0, t1, y0, y1) per segment
+
+    Readout:
+      updated static token -> latent spline coefficients (and optional bias)
+      then decode -> trajectory yhat(t) using BSplineBasis matrix Phi(t)
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        # ----- config -> scalars -----
+        n_static = int(config.n_features)
+        n_motif_classes = int(config.n_motif_classes)
+        n_basis_out = int(config.n_basis)
+
+        d_model = int(config.transformer.d_model)
+        n_heads = int(config.transformer.n_heads)
+        n_layers = int(config.transformer.n_layers)
+        d_ff = int(config.transformer.d_ff)
+        dropout = float(config.transformer.dropout_p)
+
+        self.dynamic_bias = bool(getattr(config, "dynamic_bias", False))
+        self.out_dim = n_basis_out + (1 if self.dynamic_bias else 0)
+
+        # ----- encoders -----
+        self.static_enc = StaticTokenEncoder(
+            n_static,
+            d_model,
+            hidden=d_ff // 2,
+            dropout=dropout,
+        )
+        self.motif_enc = SemanticTokenEncoder(
+            n_motif_classes=n_motif_classes,
+            d_model=d_model,
+            class_emb_dim=min(64, d_model // 2),
+            cont_hidden=d_ff // 2,
+            dropout=dropout,
+        )
+
+        # token type embedding: 0=static, 1=motif
+        self.type_emb = nn.Embedding(2, d_model)
+
+        # ----- transformer -----
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_ff,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            enc_layer,
+            num_layers=n_layers,
+        )
+
+        # ----- head predicts coeffs -----
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, self.out_dim),
+        )
+
+        # ----- spline basis -----
+        self.bspline = BSplineBasis(
+            self.config.n_basis,
+            (0, self.config.T),
+            internal_knots=self.config.internal_knots,
+        )
+
+        self._cached_t: Optional[torch.Tensor] = None
+        self._cached_Phi: Optional[torch.Tensor] = None
+
+    def _phi_from_t(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Build (or reuse cached) Phi matrix for B-splines.
+
+        Args:
+            t: (T,) or (B,T) float tensor
+        Returns:
+            Phi: (B,T,n_basis) float tensor
+        """
+        if t.ndim == 1:
+            t0 = t
+            B = 1
+        else:
+            t0 = t[0]
+            B = t.shape[0]
+
+        # If grid is unchanged, reuse cached Phi
+        if self._cached_t is not None and self._cached_Phi is not None:
+            if torch.allclose(t0, self._cached_t):
+                return self._cached_Phi.expand(B, -1, -1)
+
+        # Compute Phi on CPU via the existing numpy-based bspline.get_matrix
+        Phi_np = self.bspline.get_matrix(t0.detach().cpu().numpy())  # (T, n_basis)
+        Phi = torch.from_numpy(Phi_np).float().to(t.device).unsqueeze(0)  # (1,T,n_basis)
+
+        # Cache using detached copy of t0
+        self._cached_t = t0.detach()
+        self._cached_Phi = Phi
+
+        return Phi.expand(B, -1, -1)
+
+    def forward(
+        self,
+        x_static: torch.Tensor,                 # (B, n_static)
+        motif_class: torch.Tensor,              # (B, K) long
+        semantic_vals: torch.Tensor,               # (B, K, 4) float: [t0,t1,y0,y1]
+        t: torch.Tensor,                        # (B, T) or (T,)
+        semantic_key_padding_mask: Optional[torch.Tensor] = None,  # (B, K) bool, True=PAD
+    ) -> torch.Tensor:
+        """
+        Returns:
+            yhat: (B, T) predicted trajectory
+        """
+        B, K = motif_class.shape
+        device = x_static.device
+
+        # ---- build tokens ----
+        static_tok = self.static_enc(x_static).unsqueeze(1)    # (B,1,d_model)
+        semantic_toks = self.motif_enc(motif_class, semantic_vals)   # (B,K,d_model)
+        tokens = torch.cat([static_tok, semantic_toks], dim=1)    # (B,1+K,d_model)
+
+        # ---- type embeddings ----
+        type_ids = torch.cat(
+            [
+                torch.zeros(B, 1, dtype=torch.long, device=device),
+                torch.ones(B, K, dtype=torch.long, device=device),
+            ],
+            dim=1,
+        )  # (B,1+K)
+        tokens = tokens + self.type_emb(type_ids)
+
+        # ---- key padding mask ----
+        if semantic_key_padding_mask is None:
+            key_padding_mask = None
+        else:
+            key_padding_mask = torch.cat(
+                [torch.zeros(B, 1, dtype=torch.bool, device=device), semantic_key_padding_mask],
+                dim=1
+            )  # (B,1+K)
+
+        # ---- transformer ----
+        h = self.transformer(tokens, src_key_padding_mask=key_padding_mask)  # (B,1+K,d_model)
+
+        # ---- latent coeffs (+ optional bias) ----
+        coeffs = self.head(h[:, 0, :])  # (B, out_dim) 
+
+        # ---- decode to trajectory ----
+        Phi = self._phi_from_t(t)       # (B,T,n_basis)
+
+        if self.dynamic_bias:
+            c = coeffs[:, :-1]          # (B,n_basis)
+            b = coeffs[:, -1:]          # (B,1)
+            yhat = torch.einsum("btn,bn->bt", Phi, c) + b
+        else:
+            yhat = torch.einsum("btn,bn->bt", Phi, coeffs)
+
+        return yhat  # (B, T)

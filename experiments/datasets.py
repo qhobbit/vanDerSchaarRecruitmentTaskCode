@@ -1,3 +1,9 @@
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
 from timeview.data import BaseDataset
 from abc import ABC, abstractmethod
 import json
@@ -8,6 +14,11 @@ import glob
 from scipy.stats import beta
 from timeview.knot_selection import *
 from experiments.dynamic_modeling import *
+from timeview.basis import BSplineBasis
+from typing import Optional
+from dataclasses import dataclass
+from scipy.special import betaln
+
 
 def save_dataset(dataset_name, dataset_builder, dataset_dictionary, notes="", dataset_description_path="dataset_descriptions"):
     # Check if a dataset description directory exists. If not, create it.
@@ -757,498 +768,884 @@ class TumorDataset(BaseDataset):
         return ['y0']
 
 
-class SyntheticTumorDataset(BaseDataset):
 
-    def __init__(self, **args):
-        super().__init__(**args)
-        if self.args.equation == "wilkerson_dynamic":
-            X, X_dynamic, ts, ys = SyntheticTumorDataset.synthetic_tumor_data(
-                        n_samples = self.args.n_samples,
-                        n_time_steps = self.args.n_time_steps,
-                        time_horizon = self.args.time_horizon,
-                        noise_std = self.args.noise_std,
-                        seed = self.args.seed,
-                        equation = self.args.equation)
+# ============================================================
+# Helper functions for Van der Schaar recruitment task
+# ============================================================
+
+@dataclass
+class SemanticConstraintConfig:
+    """
+    Controls probabilistic enforcement of semantic constraints
+    on spline intervals.
+
+    Each interval is independently sampled to be:
+      - constant
+      - linear
+      - unconstrained
+
+    A global cap avoids over-constraining a single spline.
+    """
+    p_force_linear: float = 0.25
+    p_force_constant: float = 0.10
+    max_forced_intervals: int = 3
+
+
+def _project_to_linear_constraints(c0: np.ndarray, A: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    Orthogonal projection of coefficient vector c0 onto the affine subspace:
+
+        { c : A c = b }
+
+    Solves:
+        argmin ||c - c0||₂  subject to  A c = b
+
+    Closed-form solution:
+        c = c0 - Aᵀ (A Aᵀ)⁻¹ (A c0 - b)
+
+    Uses least-squares for numerical stability.
+    """
+    if A.size == 0:
+        return c0
+
+    rhs = (A @ c0) - b
+    M = A @ A.T
+    lam, *_ = np.linalg.lstsq(M, rhs, rcond=None)
+    c = c0 - (A.T @ lam)
+    return c
+
+
+def sample_inputs_from_bsplinebasis(
+    n_samples: int,
+    t: np.ndarray,
+    n_basis: int = 8,
+    coeff_std: float = 1.0,
+    seed: int = 0,
+    random_internal_knots: bool = True,
+    knot_jitter: float = 0.15,
+    semantic_cfg: Optional[SemanticConstraintConfig] = None,
+):
+    """
+    Samples spline-valued input trajectories u(t) by drawing
+    B-spline coefficients and optionally enforcing semantic
+    (constant / linear) constraints on selected intervals.
+
+    Returns:
+      u:      (n_samples, T) spline evaluations
+      coeffs: (n_samples, n_basis) spline coefficients
+      basis:  BSplineBasis instance used
+    """
+    rng = np.random.default_rng(seed)
+    t = np.asarray(t, dtype=float)
+
+    # Number of internal knots required by cubic B-splines
+    n_internal = n_basis - 3 + 1
+
+    if random_internal_knots:
+        # Jittered knot placement around uniform grid
+        base = np.linspace(0.0, 1.0, n_internal)
+        jitter = rng.normal(0.0, knot_jitter, size=n_internal)
+        internal = np.clip(base + jitter, 0.0, 1.0)
+        internal.sort()
+
+        # Explicitly pin endpoints for numerical robustness
+        internal[0] = 0.0
+        internal[-1] = 1.0
+    else:
+        internal = np.linspace(0.0, 1.0, n_internal)
+
+    basis = BSplineBasis(n_basis=n_basis, t_range=(0.0, 1.0), internal_knots=internal)
+    B = basis.get_matrix(t)  # (T, n_basis)
+
+    # Tensor mapping spline coefficients to per-interval monomial coefficients
+    P = basis.monomial_tensor()  # (4, n_intervals, n_basis)
+    n_intervals = P.shape[1]
+
+    if semantic_cfg is None:
+        semantic_cfg = SemanticConstraintConfig()
+
+    coeffs = np.zeros((n_samples, n_basis), dtype=float)
+    u = np.zeros((n_samples, len(t)), dtype=float)
+
+    for i in range(n_samples):
+        c0 = rng.normal(0.0, coeff_std, size=n_basis)
+
+        # Sample which intervals are constrained
+        forced_all = []
+        for j in range(n_intervals):
+            r = rng.random()
+            if r < semantic_cfg.p_force_constant:
+                forced_all.append((j, "constant"))
+            elif r < semantic_cfg.p_force_constant + semantic_cfg.p_force_linear:
+                forced_all.append((j, "linear"))
+
+        # Enforce a maximum number of constrained intervals
+        if len(forced_all) > semantic_cfg.max_forced_intervals:
+            idx = rng.choice(len(forced_all), size=semantic_cfg.max_forced_intervals, replace=False)
+            forced = [forced_all[k] for k in idx]
         else:
-            X, ts, ys = SyntheticTumorDataset.synthetic_tumor_data(
-                            n_samples = self.args.n_samples,
-                            n_time_steps = self.args.n_time_steps,
-                            time_horizon = self.args.time_horizon,
-                            noise_std = self.args.noise_std,
-                            seed = self.args.seed,
-                            equation = self.args.equation)
-        if self.args.equation == "wilkerson":
-            self.X = pd.DataFrame(X, columns=["age", "weight", "initial_tumor_volume", "dosage"])
-        elif self.args.equation == "geng":
-            self.X = pd.DataFrame(X, columns=["age", "weight", "initial_tumor_volume", "start_time", "dosage"])
-        elif self.args.equation == "wilkerson_dynamic":
-            self.X = pd.DataFrame(X, columns=["age", "weight", "initial_tumor_volume", "dosage"])
-            blood_pressure_col = [X_dynamic[i, :, 0].tolist() for i in range(X_dynamic.shape[0])]
-            oxygen_saturation_col = [X_dynamic[i, :, 1].tolist() for i in range(X_dynamic.shape[0])]
-            glucose_levels_col = [X_dynamic[i, :, 2].tolist() for i in range(X_dynamic.shape[0])]
-            self.X_dynamic = pd.DataFrame({
-                'blood_pressure': blood_pressure_col,
-                'oxygen_saturation': oxygen_saturation_col,
-                'glucose_levels': glucose_levels_col
-            })
+            forced = forced_all
 
-        self.ts = ts
-        self.ys = ys
-    
-    def get_X_ts_ys(self):
-        if self.args.equation == "wilkerson_dynamic":
-            return self.X, self.X_dynamic, self.ts, self.ys
+        # Build linear constraint system A c = b
+        rows = []
+        rhs = []
+
+        for (j, kind) in forced:
+            # Cubic monomial: a0 + a1 t + a2 t² + a3 t³
+            if kind == "linear":
+                rows.append(P[2, j, :])  # a2 = 0
+                rhs.append(0.0)
+                rows.append(P[3, j, :])  # a3 = 0
+                rhs.append(0.0)
+            elif kind == "constant":
+                rows.append(P[1, j, :])  # a1 = 0
+                rhs.append(0.0)
+                rows.append(P[2, j, :])  # a2 = 0
+                rhs.append(0.0)
+                rows.append(P[3, j, :])  # a3 = 0
+                rhs.append(0.0)
+
+        if rows:
+            A = np.vstack(rows)
+            bvec = np.asarray(rhs, float)
+            c = _project_to_linear_constraints(c0, A, bvec)
         else:
-            return self.X, self.ts, self.ys
+            c = c0
 
-    def __len__(self):
-        return len(self.X)
-    
-    def get_feature_ranges(self):
-        if self.args.equation == "wilkerson":
-            return {
-                "age": (20, 80),
-                "weight": (40, 100),
-                "initial_tumor_volume": (0.1, 0.5),
-                "dosage": (0.0, 1.0),
-                }
-        elif self.args.equation == "geng":
-            return {
-                "age": (20, 80),
-                "weight": (40, 100),
-                "initial_tumor_volume": (0.1, 0.5),
-                "start_time": (0.0, 1.0),
-                "dosage": (0.0, 1.0)
-                }
-        elif self.args.equation == "wilkerson_dynamic":
-            return {
-                "age": (20, 80),
-                "weight": (40, 100),
-                "initial_tumor_volume": (0.1, 0.5),
-                "dosage": (0.0, 1.0),
-                "blood_pressure": (130, 15, 60),
-                "oxygen_saturation" : (93, 3, 60),
-                "glucose_levels": (120, 30, 60)
-                }
+        coeffs[i] = c
+        u[i] = B @ c
 
-    def get_feature_names(self):
-        if self.args.equation == "wilkerson":
-            return ["age", "weight", "initial_tumor_volume", "dosage"]
-        elif self.args.equation == "geng":
-            return ["age", "weight", "initial_tumor_volume", "start_time", "dosage"]
-        elif self.args.equation == "wilkerson_dynamic":
-            return ["age", "weight", "initial_tumor_volume", "dosage", "blood_pressure", "oxygen_saturation", "glucose_levels"]
+    return u, coeffs, basis
+
+def make_ts_0_1(n_timesteps: int) -> np.ndarray:
+    """Uniform grid on [0, 1] with endpoint included."""
+    return np.linspace(0.0, 1.0, n_timesteps)
 
 
-
-    def _tumor_volume(t, age, weight, initial_tumor_volume, start_time, dosage):
-        """
-        Computes the tumor volume at times t based on the tumor model under chemotherapy described in the paper.
-
-        Args:
-            t: numpy array of real numbers that are the times at which to compute the tumor volume
-            age: a real number that is the age
-            weight: a real number that is the weight
-            initial_tumor_volume: a real number that is the initial tumor volume
-            start_time: a real number that is the start time of chemotherapy
-            dosage: a real number that is the chemotherapy dosage
-        Returns:
-            Vs: numpy array of real numbers that are the tumor volumes at times t
-        """
-
-        RHO_0=2.0
-
-        K_0=1.0
-        K_1=0.01
-
-        BETA_0=50.0
-
-        GAMMA_0=5.0
-
-        V_min=0.001
-
-        # Set the parameters of the tumor model
-        rho=RHO_0 * (age / 20.0) ** 0.5
-        K=K_0 + K_1 * (weight)
-        beta=BETA_0 * (age/20.0) ** (-0.2)
-
-        # Create chemotherapy function
-        def C(t):
-            return np.where(t < start_time, 0.0, dosage * np.exp(- GAMMA_0 * (t - start_time)))
-
-        def dVdt(V, t):
-            """
-            This is the tumor model under chemotherapy.
-            Args:
-                V: a real number that is the tumor volume
-                t: a real number that is the time
-            Returns:
-                dVdt: a real number that is the rate of change of the tumor volume
-            """
-
-            dVdt=rho * (V-V_min) * V * np.log(K / V) - beta * V * C(t)
-
-            return dVdt
-
-        # Integrate the tumor model
-        V=odeint(dVdt, initial_tumor_volume, t)[:, 0]
-        return V
+def coeffs_to_frame(coeffs: np.ndarray, prefix: str = "c") -> pd.DataFrame:
+    """Stores spline coefficients in a DataFrame."""
+    return pd.DataFrame({f"{prefix}{j}": coeffs[:, j] for j in range(coeffs.shape[1])})
 
 
-    def _tumor_volume_2(t, age, weight, initial_tumor_volume, dosage):
-        """
-        Computes the tumor volume at times t based on the tumor model under chemotherapy described in the paper.
-
-        Args:
-            t: numpy array of real numbers that are the times at which to compute the tumor volume
-            age: a real number that is the age
-            weight: a real number that is the weight
-            initial_tumor_volume: a real number that is the initial tumor volume
-            start_time: a real number that is the start time of chemotherapy
-            dosage: a real number that is the chemotherapy dosage
-        Returns:
-            Vs: numpy array of real numbers that are the tumor volumes at times t
-        """
-
-        G_0=2.0
-        D_0=180.0
-        PHI_0=10
-
-        # Set the parameters of the tumor model
-        # rho = RHO_0 * (age / 20.0) ** 0.5
-        # K = K_0 + K_1 * (weight)
-        # beta = BETA_0 * (age/20.0) ** (-0.2)
-
-        g=G_0 * (age / 20.0) ** 0.5
-        d=D_0 * dosage/weight
-        # sigmoid function
-        phi=1 / (1 + np.exp(-dosage*PHI_0))
-
-        return initial_tumor_volume * (phi*np.exp(-d * t) + (1-phi)*np.exp(g * t))
-    
-    def _tumor_volume_3(t, age, weight, initial_tumor_volume, dosage, blood_pressure, oxygen_saturation, glucose_levels):
-        """
-        Computes the tumor volume at times t based on the tumor model under chemotherapy described in the paper.
-
-        Args:
-            t: numpy array of real numbers that are the times at which to compute the tumor volume
-            age: a real number that is the age
-            weight: a real number that is the weight
-            initial_tumor_volume: a real number that is the initial tumor volume
-            start_time: a real number that is the start time of chemotherapy
-            dosage: a real number that is the chemotherapy dosage
-        Returns:
-            Vs: numpy array of real numbers that are the tumor volumes at times t
-        """
-
-        G_0=2.0
-        D_0=180.0
-        PHI_0=10
-
-        # Set the parameters of the tumor model
-        # rho = RHO_0 * (age / 20.0) ** 0.5
-        # K = K_0 + K_1 * (weight)
-        # beta = BETA_0 * (age/20.0) ** (-0.2)
-        avg_bp = np.mean(blood_pressure)
-        avg_glucose = np.mean(glucose_levels)
-
-        g=G_0 * (age / 20.0) ** 0.5 * (1 + 0.01 * (avg_bp - 130)) * (1 + 0.01 * (avg_glucose - 120))
-
-        avg_spo2 = np.mean(oxygen_saturation)
-        d=D_0 * dosage/weight * (1 + 0.01 * (avg_spo2 - 93))
-        # sigmoid function
-        phi=1 / (1 + np.exp(-dosage*PHI_0))
-
-        return initial_tumor_volume * (phi*np.exp(-d * t) + (1-phi)*np.exp(g * t))
+def softplus(x: np.ndarray) -> np.ndarray:
+    """Numerically stable softplus."""
+    return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0.0)
 
 
-    def _get_tumor_feature_ranges(*feautures):
-        """
-        Gets the ranges of the tumor features.
+def beta_fn(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Computes Beta(a, b) via log-space evaluation."""
+    return np.exp(betaln(a, b))
 
-        Args:
-            feautures: a list of strings that are the tumor features
-        Returns:
-            ranges: a dictionary that maps the tumor features to their ranges
-        """
 
-        ranges={}
-        for feature in feautures:
-            if feature in TUMOR_DATA_FEATURE_RANGES:
-                ranges[feature]=TUMOR_DATA_FEATURE_RANGES[feature]
+# Three Synthetic Datasets used for van Der Schaar task given below
+class DynamicTumorDataset(BaseDataset):
+    """
+    Tumour-growth synthetic dataset with:
+      - Static covariates: [age, weight, initial_tumor_volume, dosage]
+      - One dynamic exogenous input u(t) (e.g., glucose), generated as a B-spline per sample
+
+    Dynamics are a bounded “Wilkerson-style” split-compartment update:
+      - Vs: “sensitive” compartment decays with rate d(dose, weight)
+      - Vr: “resistant” compartment grows with rate g_t(t), but is limited by crowding
+
+    Parameter maps:
+      phi(dose)  = sigmoid(PHI_0 * dose)           (initial split between Vs and Vr)
+      d(dose,w)  = D_0 * dose / w                  (dose effect scaled by weight)
+      g0(age)    = G_0 * sqrt(age/20)              (baseline growth from age)
+      g_t(t)     = clip(g0 + alpha*u(t), g_clip)   (input-modulated growth, clipped)
+
+    Discrete-time update (dt from the [0,1] grid unless overridden):
+      Vs_{k+1} = Vs_k * exp(-dt * d)
+      Vr_{k+1} = Vr_k * exp( dt * g_tk * crowd_k )
+      crowd_k  = clip(1 - (Vs_k + Vr_k)/K, 0, 1)
+      y_k      = Vs_k + Vr_k
+
+    Carrying capacity K is *not* tied to V0:
+      - K_mode="const":  K = K_const
+      - K_mode="weight": K = K_0 + K_1 * weight
+
+    Important constraint to avoid “starting above capacity”:
+      pick V0_range so that V0_max < K_min (computed from the minimum possible weight).
+      This avoids resampling or awkward initial conditions.
+    """
+
+    def __init__(
+        self,
+        n_samples: int = 2000,
+        n_timesteps: int = 60,
+        seed: int = 0,
+        n_basis: int = 8,
+        coeff_std: float = 1.0,
+        semantic_cfg: Optional["SemanticConstraintConfig"] = None,
+
+        # How strongly u(t) perturbs the baseline growth
+        alpha: float = 3.5,
+
+        # Baseline parameter scales for the “Wilkerson-style” maps
+        G_0: float = 2.0,
+        D_0: float = 180.0,
+        PHI_0: float = 10.0,
+        g_clip: tuple = (-5.0, 5.0),
+
+        # Carrying capacity config (kept independent of V0 by design)
+        K_mode: str = "weight",          # {"const", "weight"}
+        K_const: float = 1.4,            # used if K_mode=="const"
+        K_0: float = 1.0,                # used if K_mode=="weight"
+        K_1: float = 0.01,               # used if K_mode=="weight"
+        K_clip: Optional[tuple] = None,  # optional extra cap/floor on K
+
+        # Ranges for static covariates
+        age_range=(20.0, 80.0),
+        weight_range=(40.0, 100.0),
+        dose_range=(0.0, 1.0),
+
+        # Choose this so V0_max < K_min (so crowding starts sensible)
+        V0_range=(0.1, 0.5),
+
+        # Numerical safeguards
+        V_min: float = 1e-4,
+        dt: Optional[float] = None,
+        hard_cap_to_K: bool = False,      # optional: clip output y(t) to K
+    ):
+        super().__init__(n_samples=n_samples, n_timesteps=n_timesteps)
+        rng = np.random.default_rng(seed)
+
+        self.alpha = float(alpha)
+
+        self.G_0 = float(G_0)
+        self.D_0 = float(D_0)
+        self.PHI_0 = float(PHI_0)
+        self.g_clip = (float(g_clip[0]), float(g_clip[1]))
+
+        self.K_mode = str(K_mode)
+        self.K_const = float(K_const)
+        self.K_0 = float(K_0)
+        self.K_1 = float(K_1)
+        self.K_clip = K_clip
+
+        self.age_range = (float(age_range[0]), float(age_range[1]))
+        self.weight_range = (float(weight_range[0]), float(weight_range[1]))
+        self.dose_range = (float(dose_range[0]), float(dose_range[1]))
+        self.V0_range = (float(V0_range[0]), float(V0_range[1]))
+
+        self.V_min = float(V_min)
+
+        # Time grid is normalised to [0,1] across n_timesteps
+        t = make_ts_0_1(n_timesteps)
+        self.ts = [t.copy() for _ in range(n_samples)]
+        self.dt = float(1.0 / (n_timesteps - 1) if dt is None else dt)
+
+        # Compute K from statics (either constant or weight-dependent)
+        def K_from_statics(weight_i: float) -> float:
+            if self.K_mode == "const":
+                K = self.K_const
+            elif self.K_mode == "weight":
+                K = self.K_0 + self.K_1 * weight_i
             else:
-                raise ValueError(f"Invalid tumor feature: {feature}")
-        return ranges
+                raise ValueError(f"K_mode must be 'const' or 'weight', got {self.K_mode}")
 
+            if self.K_clip is not None:
+                K = float(np.clip(K, float(self.K_clip[0]), float(self.K_clip[1])))
 
+            # Ensure K stays above a tiny positive floor
+            return float(max(K, self.V_min + 1e-6))
 
-    def synthetic_tumor_data(n_samples,  n_time_steps, time_horizon=1.0, noise_std=0.0, seed=0, equation="wilkerson"):
-        """
-        Creates synthetic tumor data based on the tumor model under chemotherapy described in the paper.
+        # Sanity check: ensure V0_range won't violate capacity at the smallest K
+        w_min = self.weight_range[0]
+        K_min = K_from_statics(w_min)
 
-        We have five static features:
-            1. age
-            2. weight
-            3. initial tumor volume
-            4. start time of chemotherapy (only for Geng et al. model)
-            5. chemotherapy dosage
+        if not (self.V0_range[1] < K_min):
+            raise ValueError(
+                f"V0_range must satisfy V0_max < K_min to avoid starting above carrying capacity.\n"
+                f"Got V0_max={self.V0_range[1]:.4g}, but K_min={K_min:.4g}.\n"
+                f"Fix by reducing V0_range[1] or increasing K_const / K_0 / K_1 (or K_clip min)."
+            )
 
-        Args:
-            n_samples: an integer that is the number of samples
-            noise_std: a real number that is the standard deviation of the noise
-            seed: an integer that is the random seed
-        Returns:
-            X: a numpy array of shape (n_samples, 4)
-            ts: a list of n_samples 1D numpy arrays of shape (n_time_steps,)
-            ys: a list of n_samples 1D numpy arrays of shape (n_time_steps,)
-        """
-        TUMOR_DATA_FEATURE_RANGES={
-            "age": (20, 80),
-            "weight": (40, 100),
-            "initial_tumor_volume": (0.1, 0.5),
-            "start_time": (0.0, 1.0),
-            "dosage": (0.0, 1.0)
-        }
+        # Sample static covariates (i.i.d. within the given ranges)
+        age = rng.uniform(self.age_range[0], self.age_range[1], size=n_samples)
+        weight = rng.uniform(self.weight_range[0], self.weight_range[1], size=n_samples)
+        init_vol = rng.uniform(self.V0_range[0], self.V0_range[1], size=n_samples)
+        dosage = rng.uniform(self.dose_range[0], self.dose_range[1], size=n_samples)
 
-        if equation == "wilkerson_dynamic":
-            TUMOR_DATA_FEATURE_RANGES={
-            "age": (20, 80),
-            "weight": (40, 100),
-            "initial_tumor_volume": (0.1, 0.5),
-            "start_time": (0.0, 1.0),
-            "dosage": (0.0, 1.0),
-            "blood_pressure": (130, 15, 60),
-            "oxygen_saturation" : (93, 3, 60),
-            "glucose_levels": (120, 30, 60)
-        }
-
-        # Create the random number generator
-        gen=np.random.default_rng(seed)
-
-        # Sample age
-        age=gen.uniform(
-            TUMOR_DATA_FEATURE_RANGES['age'][0], TUMOR_DATA_FEATURE_RANGES['age'][1], size=n_samples)
-        # Sample weight
-        weight=gen.uniform(
-            TUMOR_DATA_FEATURE_RANGES['weight'][0], TUMOR_DATA_FEATURE_RANGES['weight'][1], size=n_samples)
-        # Sample initial tumor volume
-        tumor_volume=gen.uniform(TUMOR_DATA_FEATURE_RANGES['initial_tumor_volume']
-                                [0], TUMOR_DATA_FEATURE_RANGES['initial_tumor_volume'][1], size=n_samples)
-        # Sample start time of chemotherapy
-        start_time=gen.uniform(
-            TUMOR_DATA_FEATURE_RANGES['start_time'][0], TUMOR_DATA_FEATURE_RANGES['start_time'][1], size=n_samples)
-        # Sample chemotherapy dosage
-        dosage=gen.uniform(
-            TUMOR_DATA_FEATURE_RANGES['dosage'][0], TUMOR_DATA_FEATURE_RANGES['dosage'][1], size=n_samples)
-        
-        if equation == "wilkerson_dynamic":
-            blood_pressure = gen.normal(
-                TUMOR_DATA_FEATURE_RANGES['blood_pressure'][0], TUMOR_DATA_FEATURE_RANGES['blood_pressure'][1], size=(n_samples, TUMOR_DATA_FEATURE_RANGES['blood_pressure'][2]))
-            oxygen_saturation = gen.normal(
-                TUMOR_DATA_FEATURE_RANGES['oxygen_saturation'][0], TUMOR_DATA_FEATURE_RANGES['oxygen_saturation'][1], size=(n_samples, TUMOR_DATA_FEATURE_RANGES['oxygen_saturation'][2]))
-            glucose_levels = gen.normal(
-                TUMOR_DATA_FEATURE_RANGES['glucose_levels'][0], TUMOR_DATA_FEATURE_RANGES['glucose_levels'][1], size=(n_samples, TUMOR_DATA_FEATURE_RANGES['glucose_levels'][2]))
-
-
-        # Combine the static features into a single array
-        if equation == "wilkerson":
-            X=np.stack((age, weight, tumor_volume, dosage), axis=1)
-        elif equation == "geng":
-            X=np.stack((age, weight, tumor_volume, start_time, dosage), axis=1)
-        elif equation == "wilkerson_dynamic":
-            X=np.stack((age, weight, tumor_volume, dosage), axis=1)
-            X_dynamic = np.stack((blood_pressure, oxygen_saturation, glucose_levels), axis=2)
-
-        # Create the time points
-        ts=[np.linspace(0.0, time_horizon, n_time_steps)
-            for i in range(n_samples)]
-        
-        ts_dynamic = [np.linspace(0.0, 60, 60) for i in range(n_samples)]
-        # Create the tumor volumes
-        ys=[]
-
-        for i in range(n_samples):
-
-            # Unpack the static features
-            if equation == "wilkerson":
-                age, weight, tumor_volume, dosage=X[i, :]
-            elif equation == "geng":
-                age, weight, tumor_volume, start_time, dosage=X[i, :]
-            elif equation == "wilkerson_dynamic":
-                age, weight, tumor_volume, dosage = X[i, :]
-                blood_pressure_i = X_dynamic[i, :, 0]
-                oxygen_saturation_i = X_dynamic[i, :, 1]
-                glucose_levels_i = X_dynamic[i, :, 2]
-
-            if equation == "wilkerson":
-                ys.append(SyntheticTumorDataset._tumor_volume_2(
-                    ts[i], age, weight, tumor_volume, dosage))
-            elif equation == "geng":
-                ys.append(SyntheticTumorDataset._tumor_volume(ts[i], age, weight,
-                        tumor_volume, start_time, dosage))
-            elif equation == "wilkerson_dynamic":
-                ys.append(SyntheticTumorDataset._tumor_volume_3(
-                    ts[i], age, weight, tumor_volume, dosage, blood_pressure_i, oxygen_saturation_i, glucose_levels_i))
-
-            # Add noise to the tumor volumes
-            ys[i] += gen.normal(0.0, noise_std, size=n_time_steps)
-
-
-        # blood_pressure_knots = calculate_knot_placement(ts_dynamic, blood_pressure, n_internal_knots=9, T=30)
-        # oxygen_saturation_knots = calculate_knot_placement(ts_dynamic, oxygen_saturation, n_internal_knots=9, T=30)
-        # glucose_levels_knots = calculate_knot_placement(ts_dynamic, glucose_levels, n_internal_knots=9, T=30)
-
-        if equation == "wilkerson_dynamic":
-            blood_pressure_knots = get_regular_knots(n_time_steps, 8)
-            oxygen_saturation_knots = get_regular_knots(n_time_steps, 8)
-            glucose_levels_knots = get_regular_knots(n_time_steps, 8)
-
-            bp_splines, bp_first_deriv, bp_second_deriv = fit_cubic_splines_for_all_samples(ts_dynamic, blood_pressure, blood_pressure_knots)
-            os_splines, os_first_deriv, os_second_deriv = fit_cubic_splines_for_all_samples(ts_dynamic, oxygen_saturation, oxygen_saturation_knots)
-            gl_splines, gl_first_deriv, gl_second_deriv = fit_cubic_splines_for_all_samples(ts_dynamic, glucose_levels, glucose_levels_knots)
-
-            bp_encoded = []
-            os_encoded = []
-            gl_encoded = []
-
-            for i in range(n_samples):
-                bp_vector = encode_dynamic_feature_as_single_vector(bp_first_deriv[i], bp_second_deriv[i])
-                os_vector = encode_dynamic_feature_as_single_vector(os_first_deriv[i], os_second_deriv[i])
-                gl_vector = encode_dynamic_feature_as_single_vector(gl_first_deriv[i], gl_second_deriv[i])
-                
-                bp_vector_flat = bp_vector.flatten()
-                os_vector_flat = os_vector.flatten()
-                gl_vector_flat = gl_vector.flatten()
-
-                n_intervals = len(blood_pressure_knots) - 1
-                bp_properties = calculate_transition_properties(bp_splines[i], blood_pressure_knots, n_intervals)
-                os_properties = calculate_transition_properties(os_splines[i], oxygen_saturation_knots, n_intervals)
-                gl_properties = calculate_transition_properties(gl_splines[i], glucose_levels_knots, n_intervals)
-
-                bp_properties_flat = np.array(bp_properties).flatten()
-                os_properties_flat = np.array(os_properties).flatten()
-                gl_properties_flat = np.array(gl_properties).flatten()
-
-                bp_encoded.append(np.array([val for pair in zip(bp_vector_flat, bp_properties_flat) for val in pair]))
-                os_encoded.append(np.array([val for pair in zip(os_vector_flat, os_properties_flat) for val in pair]))
-                gl_encoded.append(np.array([val for pair in zip(gl_vector_flat, gl_properties_flat) for val in pair]))
-
-                # bp_encoded.append(bp_vector_flat)
-                # os_encoded.append(os_vector_flat)
-                # gl_encoded.append(gl_vector_flat)
-
-            X_dynamic_encoded = np.stack((bp_encoded, os_encoded, gl_encoded), axis=2)
-
-        if equation == "wilkerson_dynamic":
-            return X, X_dynamic_encoded, ts, ys
-        return X, ts, ys
-    
-class DynamicSineTransDataset(BaseDataset):
-
-    def __init__(self, n_samples=2000, n_timesteps=60):
-        super().__init__(n_samples=n_samples, n_timesteps=n_timesteps)
-        np.random.seed(0)
-        self.X = pd.DataFrame({'x':np.random.uniform(1.0,3.0, n_samples)})
-        self.X_dynamic = pd.DataFrame({
-            'x_dynamic': [np.random.normal(0.0, 1.0, (n_timesteps,)) for _ in range(n_samples)]
-        })
-
-        self.ts = [np.linspace(0,1,n_timesteps) for i in range(n_samples)]
-        self.ys = [np.sin(2*t*np.pi/(x + np.mean(x_dynamic))) for t, x, x_dynamic in zip(self.ts, self.X['x'], self.X_dynamic['x_dynamic'])]
-        x_dynamic_knots = get_regular_knots(n_timesteps, 8)
-        splines, first_derivs, second_derivs = fit_cubic_splines_for_all_samples(
-            self.ts, np.vstack(self.X_dynamic['x_dynamic']), x_dynamic_knots
+        self.X = pd.DataFrame(
+            {"age": age, "weight": weight, "initial_tumor_volume": init_vol, "dosage": dosage}
         )
-        self.X_dynamic_encoded = []
-        
+
+        # Sample u(t) as a spline and keep both values and coefficients
+        u, c, basis = sample_inputs_from_bsplinebasis(
+            n_samples=n_samples,
+            t=t,
+            n_basis=n_basis,
+            coeff_std=coeff_std,
+            seed=seed,
+            random_internal_knots=True,
+            semantic_cfg=semantic_cfg,
+        )
+
+        self.basis = basis
+        self.X_dynamic = pd.DataFrame({"x_dynamic": [u[i] for i in range(n_samples)]})
+        self.X_dynamic_coeffs = coeffs_to_frame(c, prefix="c_u_")
+
+        # Convenience maps for parameterisation (kept local for readability)
+        def g0_from_age(age_i: float) -> float:
+            return self.G_0 * (age_i / 20.0) ** 0.5
+
+        def d_from_dose_weight(dose_i: float, weight_i: float) -> float:
+            return self.D_0 * dose_i / (weight_i + 1e-8)
+
+        def phi_from_dose(dose_i: float) -> float:
+            return 1.0 / (1.0 + np.exp(-self.PHI_0 * dose_i))
+
+        # Simulate per-sample trajectories
+        self.ys = []
         for i in range(n_samples):
-            dynamic_vector = encode_dynamic_feature_as_single_vector(first_derivs[i], second_derivs[i])
-            dynamic_vector_flat = dynamic_vector.flatten()
+            age_i = float(self.X.loc[i, "age"])
+            w_i = float(self.X.loc[i, "weight"])
+            V0 = float(self.X.loc[i, "initial_tumor_volume"])
+            dose = float(self.X.loc[i, "dosage"])
 
-            n_intervals = len(x_dynamic_knots) - 1
-            dynamic_properties = calculate_transition_properties(splines[i], x_dynamic_knots, n_intervals)
+            g0 = float(g0_from_age(age_i))
+            d = float(d_from_dose_weight(dose, w_i))
+            phi = float(phi_from_dose(dose))
+            K = float(K_from_statics(w_i))
 
-            dynamic_properties_flat = np.array(dynamic_properties).flatten()
-            # dynamic_encoded = np.concatenate([dynamic_vector_flat, dynamic_properties_flat])
-            dynamic_encoded = np.array([val for pair in zip(dynamic_vector_flat, dynamic_properties_flat) for val in pair])
-            
-            self.X_dynamic_encoded.append(dynamic_encoded)
-        
-        self.X_dynamic_encoded = pd.DataFrame({'x_dynamic': self.X_dynamic_encoded})
-    
-    def get_X_ts_ys(self):
-        return self.X, self.X_dynamic_encoded, self.ts, self.ys
-    
+            Vs = np.zeros(n_timesteps, dtype=float)
+            Vr = np.zeros(n_timesteps, dtype=float)
+
+            # Initialise compartments so Vs(0)+Vr(0)=V0 (with a small positive floor)
+            Vs[0] = max(self.V_min, phi * V0)
+            Vr[0] = max(self.V_min, (1.0 - phi) * V0)
+
+            ui = u[i]
+            for k in range(n_timesteps - 1):
+                # Input-modulated growth (optionally clipped via g_clip)
+                g_t = g0 + self.alpha * float(ui[k])
+
+                # Crowding limits growth as volume approaches K
+                Vtot = float(Vs[k] + Vr[k])
+                crowd = float(np.clip(1.0 - Vtot / K, 0.0, 1.0))
+
+                Vs[k + 1] = max(self.V_min, Vs[k] * np.exp(-self.dt * d))
+                Vr[k + 1] = max(self.V_min, Vr[k] * np.exp(self.dt * g_t * crowd))
+
+            y = Vs + Vr
+            if hard_cap_to_K:
+                y = np.clip(y, 0.0, K)
+
+            self.ys.append(y)
+
+        # Precompute semantic decomposition for u(t) so downstream models can reuse it
+        self._semantics = self._build_all_semantics()
+
     def __len__(self):
         return len(self.X)
-    
+
+    def get_X_ts_ys(self):
+        return self.X, self.X_dynamic_coeffs, self.ts, self.ys
+
+    def _build_all_semantics(self):
+        return [self._build_semantics_for_sample(i) for i in range(len(self.X))]
+
+    def _build_semantics_for_sample(self, i):
+        template, transition_points = self.basis.get_template_from_coeffs(self.X_dynamic_coeffs.iloc[i])
+        t = np.asarray(self.ts[i], dtype=float)
+        u = np.asarray(self.X_dynamic.loc[i, "x_dynamic"], dtype=float)
+
+        semantics_i = []
+        for k, cls in enumerate(template):
+            t0 = float(transition_points[k])
+            t1 = float(transition_points[k + 1])
+
+            # Map semantic endpoints (t0,t1) onto nearest indices on the discrete grid
+            idx0 = int(np.searchsorted(t, t0, side="left"))
+            idx1 = int(np.searchsorted(t, t1, side="right") - 1)
+            idx0 = int(np.clip(idx0, 0, len(t) - 1))
+            idx1 = int(np.clip(idx1, 0, len(t) - 1))
+
+            # Store class + continuous endpoints and their sampled values
+            semantics_i.append((int(cls), t0, t1, float(u[idx0]), float(u[idx1])))
+        return semantics_i
+
+    def get_semantics(self, i):
+        return self._semantics[i]
+
     def get_feature_names(self):
-        return ['x']
-    
+        return ["age", "weight", "initial_tumor_volume", "dosage"]
+
     def get_feature_ranges(self):
+        # x_dynamic is a per-sample normalised spline (most values typically within ~[-3,3])
         return {
-            'x': (1, 2.5),
-            'x_dynamic' : (0, 1)
+            "age": self.age_range,
+            "weight": self.weight_range,
+            "initial_tumor_volume": self.V0_range,
+            "dosage": self.dose_range,
+            "x_dynamic": (-3.0, 3.0),
         }
-    
-class DynamicBetaDataset(BaseDataset):
 
-    def __init__(self, n_samples=2000, n_timesteps=60):
-        super().__init__(n_samples=n_samples, n_timesteps=n_timesteps)
-        np.random.seed(0)
+    def _semantic_midpoint_derivative_magnitudes(self, i: int):
+        """
+        Compute |f'(mid)| and |f''(mid)| for each semantic segment of u(t),
+        where mid = (t0+t1)/2.
 
-        n_samples_per_dim = int(np.sqrt(n_samples))
-        n_samples = n_samples_per_dim**2
-        alphas = np.linspace(1.0,4.0,n_samples_per_dim)
-        betas = np.linspace(1.0,4.0,n_samples_per_dim)
+        Uses:
+          - semantic endpoints already stored in self._semantics[i]
+          - the spline reconstructed directly from stored coefficients (no refit)
+        """
+        semantics_i = self.get_semantics(i)  # list of (cls, t0, t1, y0, y1)
 
-        grid = np.meshgrid(alphas, betas)
-    
-        cart_prod = np.stack(grid, axis=-1).reshape(-1, 2)
+        coeffs_1d = np.asarray(self.X_dynamic_coeffs.iloc[i], dtype=float).ravel()
+        spline = self.basis.get_spline_with_coeffs(coeffs_1d)
 
-        self.X = pd.DataFrame({'alpha':cart_prod[:,0], 'beta':cart_prod[:,1]})
-        self.X_dynamic = pd.DataFrame({
-            'x_dynamic': [np.random.normal(0.0, 1.0, (n_timesteps,)) for _ in range(len(self.X))]
-        })
-        self.ts = [np.linspace(0,1,n_timesteps) for i in range(len(self.X))]
-        self.ys = [
-            np.array([np.mean(x_dynamic) + beta.pdf(t, alpha, betap) for t in np.linspace(0, 1, n_timesteps)])
-            for alpha, betap, x_dynamic in zip(self.X['alpha'], self.X['beta'], self.X_dynamic['x_dynamic'])
+        t0 = np.array([m[1] for m in semantics_i], dtype=float)
+        t1 = np.array([m[2] for m in semantics_i], dtype=float)
+        mids = 0.5 * (t0 + t1)
+
+        f1_mag = np.abs(spline.derivative(nu=1)(mids)).astype(float)
+        f2_mag = np.abs(spline.derivative(nu=2)(mids)).astype(float)
+        return f1_mag, f2_mag, mids
+
+    def encode_dynamic_interleaved_irregular_for_sample(
+    self,
+    i: int,
+    append_last_endpoint_property: bool = True,
+    ):
+        """
+        Build a flat, RNN-friendly encoding from semantic segments (irregular endpoints).
+
+        Per-semantic token (length 5):
+          [cls, |f'(mid)|, |f''(mid)|, dt, y0]
+        Optionally append the very final endpoint value y1 once, so the sequence has
+        one more “property” value than number of semantics.
+
+        Output length:
+          K*5 (+1 if append_last_endpoint_property)
+        """
+        semantics_i = self.get_semantics(i)  # (cls, t0, t1, y0, y1)
+        if len(semantics_i) == 0:
+            return np.zeros((0,), dtype=float)
+
+        f1_mag, f2_mag, _ = self._semantic_midpoint_derivative_magnitudes(i)
+
+        tokens = []
+        for k, (cls, t0, t1, y0, y1) in enumerate(semantics_i):
+            dt = float(t1) - float(t0)
+            tokens.append([float(cls), float(f1_mag[k]), float(f2_mag[k]), float(dt), float(y0)])
+
+        token_mat = np.asarray(tokens, dtype=float)  # (K, 5)
+
+        flat = token_mat.reshape(-1)
+        if append_last_endpoint_property:
+            # Add y1 of the final semantic as a single trailing “endpoint property”
+            flat = np.concatenate([flat, np.asarray([float(semantics_i[-1][4])], dtype=float)])
+
+        return flat
+
+    def get_X_dynamic_interleaved_irregular(
+        self,
+        append_last_endpoint_property: bool = True,
+    ):
+        encoded = [
+            self.encode_dynamic_interleaved_irregular_for_sample(
+                i, append_last_endpoint_property=append_last_endpoint_property
+            )
+            for i in range(len(self))
         ]
+        return pd.DataFrame({"x_dynamic": encoded})
 
-        x_dynamic_knots = get_regular_knots(n_timesteps, 8)
-        splines, first_derivs, second_derivs = fit_cubic_splines_for_all_samples(
-            self.ts, np.vstack(self.X_dynamic['x_dynamic']), x_dynamic_knots
+
+class DynamicSineTransDataset(BaseDataset):
+    """
+    Phase-modulated sine dataset.
+
+      - Static covariate: x ~ Uniform(1,3)
+      - Dynamic input: u(t) spline (one per sample)
+      - Output: y(t) = sin(2*pi*t/x + alpha*u(t))
+
+    “1-K pairing” means:
+      - you draw N_static unique static values
+      - each static value is repeated K times (with different u(t) per repetition)
+      - total samples = N_static * K (any remainder is truncated for determinism)
+    """
+    def __init__(
+        self,
+        n_samples: int = 2000,   # TOTAL samples requested (will be truncated to a multiple of K)
+        n_timesteps: int = 60,
+        seed: int = 0,
+        n_basis: int = 8,
+        coeff_std: float = 1.0,
+        semantic_cfg: Optional["SemanticConstraintConfig"] = None,
+        alpha: float = 0.5,
+        K: int = 5,
+    ):
+        if K <= 0:
+            raise ValueError(f"K must be positive, got {K}")
+
+        self.K = int(K)
+        self.N_total = int(n_samples)
+        self.N_static = self.N_total // self.K
+
+        if self.N_static == 0:
+            raise ValueError(
+                f"n_samples={n_samples} too small for K={K}"
+            )
+
+        # Force N_total to be an exact multiple of K (keeps pairing exact and repeatable)
+        self.N_total = self.N_static * self.K
+
+        super().__init__(n_samples=self.N_total, n_timesteps=n_timesteps)
+
+        rng = np.random.default_rng(seed)
+        self.alpha = float(alpha)
+
+        # Time grid in [0,1]
+        t = make_ts_0_1(n_timesteps)
+        self.ts = [t.copy() for _ in range(self.N_total)]
+
+        # Unique static draws (these will be repeated K times each)
+        X_static = pd.DataFrame({
+            "x": rng.uniform(1.0, 3.0, size=self.N_static)
+        })
+
+        # Map each repeated sample back to its static row
+        static_id = np.repeat(np.arange(self.N_static), self.K)
+
+        # Expand statics to total samples (only true covariates are stored in self.X)
+        self.X = X_static.iloc[static_id].reset_index(drop=True)
+
+        # Dynamic inputs are unique per sample (even when statics repeat)
+        u, c, basis = sample_inputs_from_bsplinebasis(
+            n_samples=self.N_total,
+            t=t,
+            n_basis=n_basis,
+            coeff_std=coeff_std,
+            seed=seed,
+            random_internal_knots=True,
+            semantic_cfg=semantic_cfg,
         )
-        self.X_dynamic_encoded = []
-        
-        for i in range(n_samples):
-            dynamic_vector = encode_dynamic_feature_as_single_vector(first_derivs[i], second_derivs[i])
-            dynamic_vector_flat = dynamic_vector.flatten()
+        self.basis = basis
+        self.X_dynamic = pd.DataFrame({"x_dynamic": [u[i] for i in range(self.N_total)]})
+        self.X_dynamic_coeffs = coeffs_to_frame(c, prefix="c_u_")
 
-            n_intervals = len(x_dynamic_knots) - 1
-            dynamic_properties = calculate_transition_properties(splines[i], x_dynamic_knots, n_intervals)
-            
-            dynamic_properties_flat = np.array(dynamic_properties).flatten()
-            # dynamic_encoded = np.concatenate([dynamic_vector_flat])
-            dynamic_encoded = np.array([val for pair in zip(dynamic_vector_flat, dynamic_properties_flat) for val in pair])
-            
-            self.X_dynamic_encoded.append(dynamic_encoded)
-        
-        self.X_dynamic_encoded = pd.DataFrame({'x_dynamic': self.X_dynamic_encoded})
-    
-    def get_X_ts_ys(self):
-        return self.X, self.X_dynamic_encoded, self.ts, self.ys
-    
+        # Generate trajectories
+        self.ys = []
+        for i in range(self.N_total):
+            x_i = float(self.X.loc[i, "x"])   # single static feature
+            y = np.sin(2.0 * np.pi * t / x_i + self.alpha * u[i])
+            self.ys.append(y)
+
+        # Cache semantic decomposition for u(t)
+        self._semantics = self._build_all_semantics()
+
     def __len__(self):
-        return len(self.X)
-    
+        return self.N_total
+
+    def get_X_ts_ys(self):
+        return self.X, self.X_dynamic_coeffs, self.ts, self.ys
+
+    def _build_all_semantics(self):
+        return [self._build_semantics_for_sample(i) for i in range(self.N_total)]
+
+    def _build_semantics_for_sample(self, i):
+        template, transition_points = self.basis.get_template_from_coeffs(
+            self.X_dynamic_coeffs.iloc[i]
+        )
+        t = np.asarray(self.ts[i], dtype=float)
+        u = np.asarray(self.X_dynamic.loc[i, "x_dynamic"], dtype=float)
+
+        semantics_i = []
+        for k, cls in enumerate(template):
+            t0 = float(transition_points[k])
+            t1 = float(transition_points[k + 1])
+
+            # Snap continuous endpoints to discrete indices for storing endpoint values
+            idx0 = int(np.searchsorted(t, t0, side="left"))
+            idx1 = int(np.searchsorted(t, t1, side="right") - 1)
+            idx0 = int(np.clip(idx0, 0, len(t) - 1))
+            idx1 = int(np.clip(idx1, 0, len(t) - 1))
+
+            semantics_i.append(
+                (int(cls), t0, t1, float(u[idx0]), float(u[idx1]))
+            )
+        return semantics_i
+
+    def get_semantics(self, i):
+        return self._semantics[i]
+
     def get_feature_names(self):
-        return ['alpha', 'beta']
-    
+        return ["x"]
+
+    def get_feature_ranges(self):
+        return {"x": (1.0, 3.0), "x_dynamic": (-3.0, 3.0)}
+
+    def _semantic_midpoint_derivative_magnitudes(self, i: int):
+        """
+        For each semantic segment of u(t), compute |f'(mid)| and |f''(mid)| with
+        mid = (t0+t1)/2, using the stored spline coefficients (no refit).
+        """
+        semantics_i = self.get_semantics(i)  # list of (cls, t0, t1, y0, y1)
+
+        coeffs_1d = np.asarray(self.X_dynamic_coeffs.iloc[i], dtype=float).ravel()
+        spline = self.basis.get_spline_with_coeffs(coeffs_1d)
+
+        t0 = np.array([m[1] for m in semantics_i], dtype=float)
+        t1 = np.array([m[2] for m in semantics_i], dtype=float)
+        mids = 0.5 * (t0 + t1)
+
+        f1_mag = np.abs(spline.derivative(nu=1)(mids)).astype(float)
+        f2_mag = np.abs(spline.derivative(nu=2)(mids)).astype(float)
+        return f1_mag, f2_mag, mids
+
+    def encode_dynamic_interleaved_irregular_for_sample(
+    self,
+    i: int,
+    append_last_endpoint_property: bool = True,
+    ):
+        """
+        Same interleaved “semantic token” encoding as the tumour dataset.
+
+        Per semantic:
+          [cls, |f'(mid)|, |f''(mid)|, dt, y0]
+        Optionally append final y1.
+        """
+        semantics_i = self.get_semantics(i)  # (cls, t0, t1, y0, y1)
+        if len(semantics_i) == 0:
+            return np.zeros((0,), dtype=float)
+
+        f1_mag, f2_mag, _ = self._semantic_midpoint_derivative_magnitudes(i)
+
+        tokens = []
+        for k, (cls, t0, t1, y0, y1) in enumerate(semantics_i):
+            dt = float(t1) - float(t0)
+            tokens.append([float(cls), float(f1_mag[k]), float(f2_mag[k]), float(dt), float(y0)])
+
+        token_mat = np.asarray(tokens, dtype=float)  # (K, 5)
+
+        flat = token_mat.reshape(-1)
+        if append_last_endpoint_property:
+            flat = np.concatenate([flat, np.asarray([float(semantics_i[-1][4])], dtype=float)])
+
+        return flat
+
+    def get_X_dynamic_interleaved_irregular(
+        self,
+        append_last_endpoint_property: bool = True,
+    ):
+        encoded = [
+            self.encode_dynamic_interleaved_irregular_for_sample(
+                i, append_last_endpoint_property=append_last_endpoint_property
+            )
+            for i in range(len(self))
+        ]
+        return pd.DataFrame({"x_dynamic": encoded})
+
+
+class DynamicBetaDataset(BaseDataset):
+    """
+    Time-varying Beta PDF dataset.
+
+      - Static covariates: (alpha, beta) laid out on a 2D grid
+      - Dynamic input: u(t) spline (one per sample)
+      - Convert statics + input into Beta shape parameters:
+            a(t) = 1 + delta + softplus(alpha + lam*u(t))
+            b(t) = 1 + delta + softplus(beta  - lam*u(t))
+      - Output: y(t) = BetaPDF(t; a(t), b(t))
+
+    “1-K pairing”:
+      - build ~N_static_target unique static grid points (rounded to a square grid)
+      - repeat each grid point K times with different u(t)
+      - total samples = N_static * K
+    """
+    def __init__(
+        self,
+        n_samples: int = 2000,          # TOTAL samples requested (will be rounded to N_static*K)
+        n_timesteps: int = 60,
+        seed: int = 0,
+        n_basis: int = 8,
+        coeff_std: float = 1.0,
+        semantic_cfg: Optional["SemanticConstraintConfig"] = None,
+        lam: float = 0.8,
+        delta: float = 1e-3,
+        K: int = 5,
+        alpha_range=(1.0, 4.0),
+        beta_range=(1.0, 4.0),
+    ):
+        if K <= 0:
+            raise ValueError(f"K must be positive, got {K}")
+
+        self.K = int(K)
+        self.N_total = int(n_samples)
+        self.N_static_target = self.N_total // self.K
+        if self.N_static_target == 0:
+            raise ValueError(f"n_samples={n_samples} too small for K={K}")
+
+        self.lam = float(lam)
+        self.delta = float(delta)
+
+        t = make_ts_0_1(n_timesteps)
+
+        # Choose a square grid size close to the target number of unique statics
+        n_per_dim = int(np.floor(np.sqrt(self.N_static_target)))
+        n_per_dim = max(n_per_dim, 1)
+
+        # Unique static points = perfect square, so we can form a clean meshgrid
+        self.N_static = n_per_dim * n_per_dim
+
+        # Total samples = N_static * K (exact pairing)
+        self.N_total = self.N_static * self.K
+
+        super().__init__(n_samples=self.N_total, n_timesteps=n_timesteps)
+        self.ts = [t.copy() for _ in range(self.N_total)]
+
+        # Build the (alpha,beta) grid
+        a_grid = np.linspace(float(alpha_range[0]), float(alpha_range[1]), n_per_dim)
+        b_grid = np.linspace(float(beta_range[0]), float(beta_range[1]), n_per_dim)
+        A, B = np.meshgrid(a_grid, b_grid)
+        cart = np.stack([A, B], axis=-1).reshape(-1, 2)  # (N_static, 2)
+        self.alpha_range = alpha_range
+        self.beta_range = beta_range
+        X_static = pd.DataFrame({"alpha": cart[:, 0], "beta": cart[:, 1]})
+
+        # Map repeated samples back to static grid points
+        static_id = np.repeat(np.arange(self.N_static), self.K)
+
+        # Expand statics to all samples (only true covariates are stored in self.X)
+        self.X = X_static.iloc[static_id].reset_index(drop=True)  # only alpha, beta
+
+        # Optional bookkeeping for pairing / plotting (kept out of self.X)
+        self.static_id = static_id
+        self.rep_id = np.tile(np.arange(self.K), self.N_static)
+
+        # Dynamic inputs are unique per sample
+        u, c, basis = sample_inputs_from_bsplinebasis(
+            n_samples=self.N_total,
+            t=t,
+            n_basis=n_basis,
+            coeff_std=coeff_std,
+            seed=seed,
+            random_internal_knots=True,
+            semantic_cfg=semantic_cfg,
+        )
+        self.basis = basis
+        self.X_dynamic = pd.DataFrame({"x_dynamic": [u[i] for i in range(self.N_total)]})
+        self.X_dynamic_coeffs = coeffs_to_frame(c, prefix="c_u_")
+
+        # Avoid exactly 0 or 1 in the Beta PDF evaluation (numerical stability)
+        eps = 1e-6
+        tt = np.clip(t, eps, 1.0 - eps)
+
+        self.ys = []
+        for i in range(self.N_total):
+            a0 = float(self.X.loc[i, "alpha"])
+            b0 = float(self.X.loc[i, "beta"])
+
+            # Time-varying Beta shape parameters
+            a_t = 1.0 + self.delta + softplus(a0 + self.lam * u[i])
+            b_t = 1.0 + self.delta + softplus(b0 - self.lam * u[i])
+
+            y = (tt ** (a_t - 1.0)) * ((1.0 - tt) ** (b_t - 1.0)) / beta_fn(a_t, b_t)
+            self.ys.append(y)
+
+        # Cache semantic decomposition for u(t)
+        self._semantics = self._build_all_semantics()
+
+    def __len__(self):
+        return self.N_total
+
+    def get_X_ts_ys(self):
+        return self.X, self.X_dynamic_coeffs, self.ts, self.ys
+
+    def _build_all_semantics(self):
+        return [self._build_semantics_for_sample(i) for i in range(self.N_total)]
+
+    def _build_semantics_for_sample(self, i):
+        template, transition_points = self.basis.get_template_from_coeffs(self.X_dynamic_coeffs.iloc[i])
+        t = np.asarray(self.ts[i], dtype=float)
+        u = np.asarray(self.X_dynamic.loc[i, "x_dynamic"], dtype=float)
+
+        semantics_i = []
+        for k, cls in enumerate(template):
+            t0 = float(transition_points[k])
+            t1 = float(transition_points[k + 1])
+
+            # Snap semantic endpoints to discrete indices to store endpoint values
+            idx0 = int(np.searchsorted(t, t0, side="left"))
+            idx1 = int(np.searchsorted(t, t1, side="right") - 1)
+            idx0 = int(np.clip(idx0, 0, len(t) - 1))
+            idx1 = int(np.clip(idx1, 0, len(t) - 1))
+
+            semantics_i.append((int(cls), t0, t1, float(u[idx0]), float(u[idx1])))
+        return semantics_i
+
+    def get_semantics(self, i):
+        return self._semantics[i]
+
+    def get_feature_names(self):
+        return ["alpha", "beta"]
+
     def get_feature_ranges(self):
         return {
-            'alpha': (1.0, 4.0),
-            'beta': (1.0, 4.0),
-            'x_dynamic' : (0, 1)
+            "alpha": (float(self.alpha_range[0]), float(self.alpha_range[1])),
+            "beta": (float(self.beta_range[0]), float(self.beta_range[1])),
+            "x_dynamic": (-3.0, 3.0),
         }
+
+    def _semantic_midpoint_derivative_magnitudes(self, i):
+        """
+        For each semantic segment of u(t), compute |f'(mid)| and |f''(mid)| with
+        mid = (t0+t1)/2, using the stored spline coefficients (no refit).
+        """
+        semantics_i = self.get_semantics(i)  # list of (cls, t0, t1, y0, y1)
+
+        coeffs_1d = np.asarray(self.X_dynamic_coeffs.iloc[i], dtype=float).ravel()
+        spline = self.basis.get_spline_with_coeffs(coeffs_1d)
+
+        t0 = np.array([m[1] for m in semantics_i], dtype=float)
+        t1 = np.array([m[2] for m in semantics_i], dtype=float)
+        mids = 0.5 * (t0 + t1)
+
+        f1_mag = np.abs(spline.derivative(nu=1)(mids)).astype(float)
+        f2_mag = np.abs(spline.derivative(nu=2)(mids)).astype(float)
+        return f1_mag, f2_mag, mids
+
+    def encode_dynamic_interleaved_irregular_for_sample(
+    self,
+    i: int,
+    append_last_endpoint_property: bool = True,
+    ):
+        """
+        Same interleaved “semantic token” encoding as the other datasets.
+
+        Per semantic:
+          [cls, |f'(mid)|, |f''(mid)|, dt, y0]
+        Optionally append final y1.
+        """
+        semantics_i = self.get_semantics(i)  # (cls, t0, t1, y0, y1)
+        if len(semantics_i) == 0:
+            return np.zeros((0,), dtype=float)
+
+        f1_mag, f2_mag, _ = self._semantic_midpoint_derivative_magnitudes(i)
+
+        tokens = []
+        for k, (cls, t0, t1, y0, y1) in enumerate(semantics_i):
+            dt = float(t1) - float(t0)
+            tokens.append([float(cls), float(f1_mag[k]), float(f2_mag[k]), float(dt), float(y0)])
+
+        token_mat = np.asarray(tokens, dtype=float)  # (K, 5)
+
+        flat = token_mat.reshape(-1)
+        if append_last_endpoint_property:
+            flat = np.concatenate([flat, np.asarray([float(semantics_i[-1][4])], dtype=float)])
+
+        return flat
+
+    def get_X_dynamic_interleaved_irregular(
+        self,
+        append_last_endpoint_property: bool = True,
+    ):
+        encoded = [
+            self.encode_dynamic_interleaved_irregular_for_sample(
+                i, append_last_endpoint_property=append_last_endpoint_property
+            )
+            for i in range(len(self))
+        ]
+        return pd.DataFrame({"x_dynamic": encoded})
